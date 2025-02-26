@@ -5,12 +5,11 @@ import (
 	"fmt"
 	"log"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
-// Generator генерирует числа.
 func Generator(ctx context.Context, ch chan<- int64, fn func(int64)) {
+	defer close(ch)
 	var i int64 = 1
 	for {
 		select {
@@ -23,87 +22,69 @@ func Generator(ctx context.Context, ch chan<- int64, fn func(int64)) {
 	}
 }
 
-// Worker обрабатывает числа.
-func Worker(wg *sync.WaitGroup, in <-chan int64, out chan<- int64) {
-	defer wg.Done()
-	for v := range in {
-		time.Sleep(10 * time.Millisecond)
-		out <- v
+func Worker(in <-chan int64, out chan<- int64) {
+	defer close(out)
+	for n := range in {
+		out <- n
+		time.Sleep(time.Millisecond)
 	}
 }
 
 func main() {
 	chIn := make(chan int64)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+	// Создаем контекст с тайм-аутом в 1 секунду
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	var atomicInputSum int64
-	var atomicInputCount int64
+	var inputSum int64
+	var inputCount int64
 
-	var genWg sync.WaitGroup
-	genWg.Add(1)
-
-	go func() {
-		defer genWg.Done()
-		Generator(ctx, chIn, func(i int64) {
-			atomic.AddInt64(&atomicInputSum, i)
-			atomic.AddInt64(&atomicInputCount, 1)
-		})
-	}()
+	go Generator(ctx, chIn, func(i int64) {
+		inputSum += i
+		inputCount++
+	})
 
 	const NumOut = 5
 	outs := make([]chan int64, NumOut)
-	var wg sync.WaitGroup
-
 	for i := 0; i < NumOut; i++ {
 		outs[i] = make(chan int64)
-		wg.Add(1)
-		go Worker(&wg, chIn, outs[i])
+		go Worker(chIn, outs[i])
 	}
 
 	amounts := make([]int64, NumOut)
 	chOut := make(chan int64, NumOut)
+	var wg sync.WaitGroup
 
-	var outWg sync.WaitGroup
-
-	for i := 0; i < NumOut; i++ {
-		outWg.Add(1)
-		go func(index int) {
-			defer outWg.Done()
-			for v := range outs[index] {
-				amounts[index]++
-				chOut <- v
+	for i, ch := range outs {
+		wg.Add(1)
+		go func(idx int, ch <-chan int64) {
+			defer wg.Done()
+			for n := range ch {
+				amounts[idx]++
+				chOut <- n
 			}
-		}(i)
+		}(i, ch)
 	}
+
+	go func() {
+		wg.Wait()
+		close(chOut)
+	}()
 
 	var count int64
 	var sum int64
-	go func() {
-		for v := range chOut {
-			sum += v
-			count++
-		}
-	}()
 
-	genWg.Wait()
-	close(chIn)
-
-	wg.Wait()
-	for i := 0; i < NumOut; i++ {
-		close(outs[i])
+	for n := range chOut {
+		count++
+		sum += n
 	}
 
-	outWg.Wait()
-	close(chOut)
-
-	inputSum := atomicInputSum
-	inputCount := atomicInputCount
 	fmt.Println("Количество чисел", inputCount, count)
 	fmt.Println("Сумма чисел", inputSum, sum)
 	fmt.Println("Разбивка по каналам", amounts)
 
+	// Проверка результатов
 	if inputSum != sum {
 		log.Fatalf("Ошибка: суммы чисел не равны: %d != %d\n", inputSum, sum)
 	}
